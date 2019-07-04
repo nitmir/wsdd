@@ -215,17 +215,17 @@ def wsd_add_types(parent):
     dev_type.text = WSD_TYPE_DEVICE_COMPUTER
 
 
-def wsd_add_endpoint_reference(parent):
+def wsd_add_endpoint_reference(uuid_, parent):
     endpoint = ElementTree.SubElement(parent, 'wsa:EndpointReference')
     address = ElementTree.SubElement(endpoint, 'wsa:Address')
-    address.text = args.uuid.urn
+    address.text = uuid_.urn
 
 
-def wsd_add_xaddr(parent, transport_addr):
+def wsd_add_xaddr(uuid_, parent, transport_addr):
     if transport_addr:
         item = ElementTree.SubElement(parent, 'wsd:XAddrs')
         item.text = 'http://{0}:{1}/{2}'.format(
-            transport_addr, WSD_HTTP_PORT, args.uuid)
+            transport_addr, WSD_HTTP_PORT, uuid_)
 
 
 def wsd_build_message(to_addr, action_str, request_header, response):
@@ -277,7 +277,7 @@ def wsd_build_message(to_addr, action_str, request_header, response):
 
 
 # WSD message type handling
-def wsd_handle_probe(probe):
+def wsd_handle_probe(uuid_, probe):
     scopes = probe.find('./wsd:Scopes', namespaces)
 
     if scopes:
@@ -298,7 +298,7 @@ def wsd_handle_probe(probe):
 
     matches = ElementTree.Element('wsd:ProbeMatches')
     match = ElementTree.SubElement(matches, 'wsd:ProbeMatch')
-    wsd_add_endpoint_reference(match)
+    wsd_add_endpoint_reference(uuid_, match)
     wsd_add_types(match)
     wsd_add_metadata_version(match)
 
@@ -311,29 +311,29 @@ def wsd_handle_resolve(resolve, xaddr):
         logger.debug('invalid resolve request: missing endpoint address')
         return None
 
-    if not addr.text == args.uuid.urn:
+    if addr.text not in args.urn2uuid:
         logger.debug(('invalid resolve request: address ({}) does not match '
-                      'own one ({})').format(addr.text, args.uuid.urn))
+                      'own one ({})').format(addr.text, args.uuid))
         return None
-
+    uuid_ = args.urn2uuid[addr.text]
     matches = ElementTree.Element('wsd:ResolveMatches')
     match = ElementTree.SubElement(matches, 'wsd:ResolveMatch')
-    wsd_add_endpoint_reference(match)
+    wsd_add_endpoint_reference(uuid_, match)
     wsd_add_types(match)
-    wsd_add_xaddr(match, xaddr)
+    wsd_add_xaddr(uuid_, match, xaddr)
     wsd_add_metadata_version(match)
 
     return matches
 
 
-def wsd_handle_get():
+def wsd_handle_get(uuid_, hostname):
     # see https://msdn.microsoft.com/en-us/library/hh441784.aspx for an example
     metadata = ElementTree.Element('wsx:Metadata')
     section = ElementTree.SubElement(metadata, 'wsx:MetadataSection', {
         'Dialect': WSDP_URI + '/ThisDevice'})
     device = ElementTree.SubElement(section, 'wsdp:ThisDevice')
     ElementTree.SubElement(device, 'wsdp:FriendlyName').text = (
-            'WSD Device {0}'.format(args.hostname))
+            'WSD Device {0}'.format(hostname))
     ElementTree.SubElement(device, 'wsdp:FirmwareVersion').text = '1.0'
     ElementTree.SubElement(device, 'wsdp:SerialNumber').text = '1'
 
@@ -349,18 +349,18 @@ def wsd_handle_get():
     rel = ElementTree.SubElement(section, 'wsdp:Relationship', {
         'Type': WSDP_URI + '/host'})
     host = ElementTree.SubElement(rel, 'wsdp:Host')
-    wsd_add_endpoint_reference(host)
+    wsd_add_endpoint_reference(uuid_, host)
     ElementTree.SubElement(host, 'wsdp:Types').text = PUB_COMPUTER
-    ElementTree.SubElement(host, 'wsdp:ServiceId').text = args.uuid.urn
+    ElementTree.SubElement(host, 'wsdp:ServiceId').text = uuid_.urn
     if args.domain:
         ElementTree.SubElement(host, PUB_COMPUTER).text = (
             '{0}/Domain:{1}'.format(
-                args.hostname if args.preserve_case else args.hostname.lower(),
+                hostname if args.preserve_case else hostname.lower(),
                 args.domain))
     else:
         ElementTree.SubElement(host, PUB_COMPUTER).text = (
             '{0}/Workgroup:{1}'.format(
-                args.hostname if args.preserve_case else args.hostname.upper(),
+                hostname if args.preserve_case else hostname.upper(),
                 args.workgroup.upper()))
 
     return metadata
@@ -389,11 +389,19 @@ def wsd_handle_message(data, interface, src_address):
     tree = ElementTree.fromstring(data)
     header = tree.find('./soap:Header', namespaces)
     msg_id = header.find('./wsa:MessageID', namespaces).text
+    urn = header.find('./wsa:To', namespaces).text
+    try:
+        uuid_ = args.urn2uuid[urn]
+    except KeyError:
+        if urn in ['urn:schemas-xmlsoap-org:ws:2005:04:discovery']:
+            urn = None
+        else:
+            logger.debug('Go unknown wsa:To: {}'.format(data))
 
     # if message came over multicast interface, check for duplicates
     if interface and wsd_is_duplicated_msg(msg_id):
         logger.debug('known message ({0}): dropping it'.format(msg_id))
-        return None
+        return []
 
     response = None
     action = header.find('./wsa:Action', namespaces).text
@@ -413,23 +421,32 @@ def wsd_handle_message(data, interface, src_address):
     logger.debug('incoming message content is {0}'.format(data))
     if action == WSD_PROBE:
         probe = body.find('./wsd:Probe', namespaces)
-        response = wsd_handle_probe(probe)
-        return wsd_build_message(WSA_ANON, WSD_PROBE_MATCH, header,
-                                 response) if response else None
+        responses = []
+        for uuid_ in args.uuid:
+            response = wsd_handle_probe(uuid_, probe)
+            if response:
+                responses.append(
+                    wsd_build_message(WSA_ANON, WSD_PROBE_MATCH, header, response)
+                )
+        return responses
     elif action == WSD_RESOLVE:
         resolve = body.find('./wsd:Resolve', namespaces)
         response = wsd_handle_resolve(resolve, interface.transport_address)
-        return wsd_build_message(WSA_ANON, WSD_RESOLVE_MATCH, header,
-                                 response) if response else None
+        if response:
+            return [wsd_build_message(WSA_ANON, WSD_RESOLVE_MATCH, header, response)]
+        else:
+            return []
     elif action == WSD_GET:
-        return wsd_build_message(
+        uuid_ = args.urn2uuid[urn]
+        hostname = args.uuid2hostname[str(uuid_)]
+        return [wsd_build_message(
             WSA_ANON,
             WSD_GET_RESPONSE,
             header,
-            wsd_handle_get())
+            wsd_handle_get(uuid_, hostname))]
     else:
         logger.debug('unhandled action {0}/{1}'.format(action, msg_id))
-        return None
+        return []
 
 
 class WSDUdpRequestHandler():
@@ -439,26 +456,26 @@ class WSDUdpRequestHandler():
 
     def handle_request(self):
         msg, address = self.interface.recv_socket.recvfrom(WSD_MAX_LEN)
-        msg = wsd_handle_message(msg, self.interface, address)
-        if msg:
+        msgs = wsd_handle_message(msg, self.interface, address)
+        for msg in msgs:
             self.enqueue_datagram(msg, address=address)
 
-    def send_hello(self):
+    def send_hello(self, uuid_):
         """WS-Discovery, Section 4.1, Hello message"""
         hello = ElementTree.Element('wsd:Hello')
-        wsd_add_endpoint_reference(hello)
+        wsd_add_endpoint_reference(uuid_, hello)
         # THINK: Microsoft does not send the transport address here due
         # to privacy reasons. Could make this optional.
-        wsd_add_xaddr(hello, self.interface.transport_address)
+        wsd_add_xaddr(uuid_, hello, self.interface.transport_address)
         wsd_add_metadata_version(hello)
 
         msg = wsd_build_message(WSA_DISCOVERY, WSD_HELLO, None, hello)
         self.enqueue_datagram(msg, msg_type='Hello')
 
-    def send_bye(self):
+    def send_bye(self, uuid_):
         """WS-Discovery, Section 4.2, Bye message"""
         bye = ElementTree.Element('wsd:Bye')
-        wsd_add_endpoint_reference(bye)
+        wsd_add_endpoint_reference(uuid_, bye)
 
         msg = wsd_build_message(WSA_DISCOVERY, WSD_BYE, None, bye)
         self.enqueue_datagram(msg, msg_type='Bye')
@@ -495,7 +512,8 @@ class WSDHttpRequestHandler(http.server.BaseHTTPRequestHandler):
         logger.info("{} - - ".format(self.address_string()) + fmt % args)
 
     def do_POST(s):
-        if s.path != '/' + str(args.uuid):
+        uuid_ = s.path.strip('/')
+        if not uuid_ in args.uuid2hostname:
             s.send_error(404)
 
         if s.headers['Content-Type'] != 'application/soap+xml':
@@ -504,12 +522,12 @@ class WSDHttpRequestHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(s.headers['Content-Length'])
         body = s.rfile.read(content_length)
 
-        response = wsd_handle_message(body, None, None)
-        if response:
+        responses = wsd_handle_message(body, None, None)
+        if len(responses) == 1:
             s.send_response(200)
             s.send_header('Content-Type', 'application/soap+xml')
             s.end_headers()
-            s.wfile.write(response)
+            s.wfile.write(responses[0])
         else:
             s.send_error(500)
 
@@ -579,7 +597,9 @@ def parse_args():
     parser.add_argument(
         '-u', '--uuid',
         help='UUID for the target device',
-        default=None)
+        default=None,
+        nargs='*'
+    )
     parser.add_argument(
         '-v', '--verbose',
         help='increase verbosity',
@@ -587,12 +607,12 @@ def parse_args():
     parser.add_argument(
         '-d', '--domain',
         help='set domain name (disables workgroup)',
-        default=None)
+        default=None,
+    )
     parser.add_argument(
         '-n', '--hostname',
         help='override (NetBIOS) hostname to be used (default hostname)',
-        # use only the local part of a possible FQDN
-        default=socket.gethostname().partition('.')[0])
+        nargs='*')
     parser.add_argument(
         '-w', '--workgroup',
         help='set workgroup name (default WORKGROUP)',
@@ -639,12 +659,20 @@ def parse_args():
     if not args.interface:
         logger.warning('no interface given, using all interfaces')
 
+    if not args.hostname:
+        args.hostname.append(socket.gethostname().partition('.')[0])
+
     if not args.uuid:
-        args.uuid = uuid.uuid5(uuid.NAMESPACE_DNS, socket.gethostname())
+        args.uuid = [uuid.uuid5(uuid.NAMESPACE_DNS, hostname) for hostname in args.hostname]
         logger.info('using pre-defined UUID {0}'.format(str(args.uuid)))
     else:
-        args.uuid = uuid.UUID(args.uuid)
+        if len(args.uuid) != len(args.hostname):
+            raise ValueError("please give the same number of uuid and hostname")
+        args.uuid = [uuid.UUID(uuid_) for uuid_ in args.uuid]
         logger.info('user-supplied device UUID is {0}'.format(str(args.uuid)))
+    args.uuid2hostname = {str(uuid_): hostname for uuid_, hostname in zip(args.uuid, args.hostname)}
+    args.urn2uuid = {uuid_.urn: uuid_ for uuid_ in args.uuid}
+    args.hostname2uuid = {hostname: uuid_ for uuid_, hostname in zip(args.uuid, args.hostname)}
 
     for prefix, uri in namespaces.items():
         ElementTree.register_namespace(prefix, uri)
@@ -715,7 +743,8 @@ def serve_wsd_requests(addresses):
     # everything is set up, announce ourself and serve requests
     try:
         for srv in udp_srvs:
-            srv.send_hello()
+            for uuid_ in args.uuid:
+                srv.send_hello(uuid_)
 
         while True:
             try:
@@ -734,7 +763,8 @@ def serve_wsd_requests(addresses):
 
     # say goodbye
     for srv in udp_srvs:
-        srv.send_bye()
+        for uuid_ in args.uuid:
+            srv.send_bye(uuid_)
 
     send_outstanding_messages(True)
 
